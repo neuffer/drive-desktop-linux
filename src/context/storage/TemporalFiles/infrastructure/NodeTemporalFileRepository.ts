@@ -270,12 +270,20 @@ export class NodeTemporalFileRepository implements TemporalFileRepository {
       throw new Error(`Document with path ${documentPath.value} not found`);
     }
 
-    const watcher = watch(pathToWatch, (_, filename) => {
-      if (filename !== documentPath.nameWithExtension()) {
+    // Only one file is watched, so every event is about that file. The filter
+    // that used to stand here compared fs.watch's reported name (the UUID this
+    // repository maps the document to) against the logical name on the drive,
+    // which can never be equal, so the callback was never reached.
+    let notified = false;
+
+    const watcher = watch(pathToWatch, () => {
+      if (notified) {
         return;
       }
 
-      logger.warn({ msg: `Filename: ${filename}, has been changed` });
+      notified = true;
+
+      logger.warn({ msg: `Backing file for ${documentPath.value} has changed` });
 
       callback();
     });

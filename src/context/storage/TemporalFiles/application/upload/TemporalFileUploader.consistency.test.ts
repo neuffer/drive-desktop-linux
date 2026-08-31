@@ -164,6 +164,40 @@ describe('TemporalFileUploader upload consistency', () => {
     });
   });
 
+  it('should abort the upload when the backing file changes underneath it', async () => {
+    await repository.create(documentPath);
+    await writeBackingFile('first version of the contents');
+
+    const temporalFile = await buildTemporalFile();
+
+    // Passes through to the real watcher and reports when it has fired, so the
+    // assertion does not race fs.watch's delivery.
+    const watchFile = repository.watchFile.bind(repository);
+    let watcherFired = false;
+
+    vi.spyOn(repository, 'watchFile').mockImplementation((watchedPath, callback) =>
+      watchFile(watchedPath, () => {
+        watcherFired = true;
+        callback();
+      }),
+    );
+
+    uploaderFactory.failNextAttempts = 1;
+    uploaderFactory.afterAttempt = async (attemptNumber) => {
+      if (attemptNumber === 1) {
+        await writeBackingFile('a completely different second version');
+        await vi.waitFor(() => expect(watcherFired).toBe(true));
+      }
+    };
+
+    const sut = new TemporalFileUploader(repository, uploaderFactory, eventBus);
+
+    await expect(sut.run(temporalFile)).rejects.toMatchObject({ cause: 'ABORTED' });
+
+    expect(uploaderFactory.attempts).toHaveLength(1);
+    expect(eventBus.publish).not.toHaveBeenCalled();
+  });
+
   it('should publish the number of bytes it uploaded, not the size read earlier', async () => {
     await repository.create(documentPath);
     await writeBackingFile('short');

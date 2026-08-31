@@ -44,6 +44,25 @@ describe('NodeTemporalFileRepository', () => {
     expect(result.isPresent()).toBe(false);
   });
 
+  it('should notify when the backing file changes while it is being watched', async () => {
+    const documentPath = new TemporalFilePath('/Documents/notes.txt');
+
+    await repository.create(documentPath);
+
+    const callback = vi.fn();
+    const stopWatching = repository.watchFile(documentPath, callback);
+
+    try {
+      await repository.write(documentPath, Buffer.from('content'), 7, 0);
+
+      // fs.watch delivers asynchronously, so the assertion has to wait for the
+      // event rather than run on the next tick.
+      await vi.waitFor(() => expect(callback).toHaveBeenCalled());
+    } finally {
+      stopWatching();
+    }
+  });
+
   describe('createUploadSnapshot', () => {
     async function readAll(stream: NodeJS.ReadableStream): Promise<string> {
       const chunks: Array<Buffer> = [];
