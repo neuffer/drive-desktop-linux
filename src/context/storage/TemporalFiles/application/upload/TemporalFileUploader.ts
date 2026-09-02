@@ -39,7 +39,16 @@ export class TemporalFileUploader {
         path: temporalFile.path.value,
       });
 
-      await this.publishUploadEvent(TemporalFileUploader.EMPTY_CONTENTS_ID, temporalFile, replaces);
+      // An empty staged copy still has to be reapable, or every later close of
+      // the path re-enters the override with nothing to upload.
+      const emptyStaged = await this.readStaged(temporalFile);
+
+      await this.publishUploadEvent(
+        TemporalFileUploader.EMPTY_CONTENTS_ID,
+        temporalFile,
+        replaces,
+        emptyStaged?.revision,
+      );
 
       return TemporalFileUploader.EMPTY_CONTENTS_ID;
     }
@@ -75,11 +84,11 @@ export class TemporalFileUploader {
     const stopWatching = this.repository.watchFile(temporalFile.path, () => controller.abort());
 
     try {
-      const { contentsId, revision } = await this.uploadWithRetry(temporalFile, controller, replaces);
+      const { contentsId, revision, size } = await this.uploadWithRetry(temporalFile, controller, replaces);
 
       logger.debug({ msg: `${temporalFile.path.value} uploaded with id ${contentsId}` });
 
-      await this.publishUploadEvent(contentsId, temporalFile, replaces, revision);
+      await this.publishUploadEvent(contentsId, temporalFile, replaces, revision, size);
 
       return contentsId;
     } finally {
@@ -91,7 +100,7 @@ export class TemporalFileUploader {
     temporalFile: TemporalFile,
     controller: AbortController,
     replaces?: Replaces,
-  ): Promise<{ contentsId: ContentsId; revision: number | undefined }> {
+  ): Promise<{ contentsId: ContentsId; revision: number | undefined; size: number }> {
     const errorHandler = createTransientErrorHandler({
       tag: 'SYNC-ENGINE',
       context: 'TEMPORAL FILE UPLOAD RETRY',
@@ -113,7 +122,7 @@ export class TemporalFileUploader {
     temporalFile: TemporalFile,
     controller: AbortController,
     replaces?: Replaces,
-  ): Promise<Result<{ contentsId: ContentsId; revision: number | undefined }, DriveDesktopError>> {
+  ): Promise<Result<{ contentsId: ContentsId; revision: number | undefined; size: number }, DriveDesktopError>> {
     try {
       // Read the revision here rather than reusing the one the caller found:
       // between that lookup and this point the file has been size-checked and
@@ -127,19 +136,27 @@ export class TemporalFileUploader {
       // costs one extra upload. Reading it after the open would make the
       // recorded revision newer than the bytes sent, and the reaper would
       // delete a staged copy holding data that never reached the cloud.
-      const revision = await this.readRevision(temporalFile);
+      // ONE snapshot. The length declared to the network, the size recorded on
+      // the event and the revision the reaper is asked to trust must all
+      // describe the same state of the staged copy. Refreshing only the
+      // revision is worse than refreshing nothing: the reaper then believes a
+      // pairing that never existed, and deletes the only complete copy of a
+      // file the upload truncated.
+      const staged = await this.readStaged(temporalFile);
+      const document = staged ?? temporalFile;
+      const revision = staged?.revision;
 
       const stream = await this.repository.stream(temporalFile.path);
 
       const uploader = this.uploaderFactory
         .read(stream)
-        .document(temporalFile)
+        .document(document)
         .replaces(replaces)
         .abort(controller)
         .build();
 
       const uploadedContentsId = await uploader();
-      return { data: { contentsId: uploadedContentsId as ContentsId, revision } };
+      return { data: { contentsId: uploadedContentsId as ContentsId, revision, size: document.size.value } };
     } catch (uploadError) {
       return {
         error: mapEnvironmentUploadError(uploadError as Error & { status?: unknown }),
@@ -154,11 +171,11 @@ export class TemporalFileUploader {
    * user's bytes. An unknown revision costs one skipped reap instead, because
    * the reaper keeps a staged copy it cannot identify.
    */
-  private async readRevision(temporalFile: TemporalFile): Promise<number | undefined> {
+  private async readStaged(temporalFile: TemporalFile): Promise<TemporalFile | undefined> {
     try {
       const staged = await this.repository.find(temporalFile.path);
 
-      return staged?.isPresent() ? staged.get().revision : undefined;
+      return staged?.isPresent() ? staged.get() : undefined;
     } catch (error) {
       logger.warn({
         msg: '[TemporalFileUploader] Could not read the staged revision; the staged copy will be kept',
@@ -175,12 +192,13 @@ export class TemporalFileUploader {
     temporalFile: TemporalFile,
     replaces?: Replaces,
     uploadedRevision?: number,
+    uploadedSize?: number,
   ): Promise<void> {
     const fileBuffer = await this.getThumbnailBufferIfNeeded(temporalFile);
 
     const contentsUploadedEvent = new TemporalFileUploadedDomainEvent({
       aggregateId: contentsId,
-      size: temporalFile.size.value,
+      size: uploadedSize ?? temporalFile.size.value,
       path: temporalFile.path.value,
       replaces: replaces?.contentsId,
       fileBuffer,

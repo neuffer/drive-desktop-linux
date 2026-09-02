@@ -83,6 +83,81 @@ describe('TemporalFileUploader', () => {
     call(eventBus.publish).toMatchObject([{ uploadedRevision: undefined }]);
   });
 
+  it('declares the length of the same snapshot whose revision it records', async () => {
+    // The window is real: run() awaits validateSpace, a network round trip,
+    // between the caller's snapshot and the stream. If the revision is
+    // refreshed and the length is not, the PUT declares the old length while
+    // sending the new bytes, and the reaper then trusts a pairing that never
+    // existed and deletes the only complete copy.
+    repository.find.mockResolvedValue(
+      Optional.of(
+        TemporalFile.from({
+          createdAt: new Date('2026-01-01T00:00:00.000Z'),
+          modifiedAt: new Date('2026-01-01T00:00:00.000Z'),
+          path: '/file.txt',
+          size: 500, // grew since the caller looked
+          revision: 43,
+        }),
+      ),
+    );
+
+    const sut = new TemporalFileUploader(repository, uploaderFactory, eventBus);
+
+    await sut.run(temporalFile, { contentsId: 'old-contents-id', name: 'file', extension: 'txt' });
+
+    // the uploader is handed the fresh snapshot, so the declared length matches
+    const handedToUploader = uploaderFactory.document.mock.calls[0][0];
+    expect(handedToUploader.size.value).toBe(500);
+    call(eventBus.publish).toMatchObject([{ size: 500, uploadedRevision: 43 }]);
+  });
+
+  it('records the revision as of the moment the stream was opened, not after', async () => {
+    // Moving the read below the stream open is the mistake the comment in the
+    // source warns about; this makes that ordering observable.
+    let current = 41;
+    const snapshot = (revision: number) =>
+      Optional.of(
+        TemporalFile.from({
+          createdAt: new Date('2026-01-01T00:00:00.000Z'),
+          modifiedAt: new Date('2026-01-01T00:00:00.000Z'),
+          path: '/file.txt',
+          size: 101,
+          revision,
+        }),
+      );
+    repository.find.mockImplementation(async () => snapshot(current));
+    repository.stream.mockImplementation(async () => {
+      current = 99; // a write lands as the stream is opened
+      return Readable.from(['content']);
+    });
+
+    const sut = new TemporalFileUploader(repository, uploaderFactory, eventBus);
+
+    await sut.run(temporalFile, { contentsId: 'old-contents-id', name: 'file', extension: 'txt' });
+
+    call(eventBus.publish).toMatchObject([{ uploadedRevision: 41 }]);
+  });
+
+  it('publishes a revision for an empty staged copy too, so it can be reaped', async () => {
+    repository.find.mockResolvedValue(
+      Optional.of(
+        TemporalFile.from({
+          createdAt: new Date('2026-01-01T00:00:00.000Z'),
+          modifiedAt: new Date('2026-01-01T00:00:00.000Z'),
+          path: '/new-zero-file.png',
+          size: 0,
+          revision: 12,
+        }),
+      ),
+    );
+
+    const sut = new TemporalFileUploader(repository, uploaderFactory, eventBus);
+
+    await sut.run(emptyTemporalFile, { contentsId: 'old-contents-id', name: 'f', extension: 'png' });
+
+    call(eventBus.publish).toMatchObject([{ uploadedRevision: 12 }]);
+  });
+
   it('publishes the revision of the staged copy it uploaded, read at stream time', async () => {
     // Whatever reaps the staged copy has to know which revision reached the
     // cloud. It must be the revision read just before the stream was opened,

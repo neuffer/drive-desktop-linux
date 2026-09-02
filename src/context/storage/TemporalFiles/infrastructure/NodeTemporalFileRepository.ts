@@ -160,6 +160,13 @@ export class NodeTemporalFileRepository implements TemporalFileRepository {
       throw new Error(`Document with path ${documentPath.value} not found`);
     }
 
+    // Bump BEFORE the mutation, never after. A close that throws once the bytes
+    // are already on disk would skip a trailing bump and leave a changed file
+    // wearing its old revision, which is the one way the reaper can be told to
+    // delete bytes the upload never sent. An unnecessary bump costs one extra
+    // upload; a missed one costs data.
+    this.bumpRevision(documentPath);
+
     const fd = fs.openSync(pathToWrite, 'r+');
     const bytes = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
 
@@ -168,8 +175,6 @@ export class NodeTemporalFileRepository implements TemporalFileRepository {
     } finally {
       fs.closeSync(fd);
     }
-
-    this.bumpRevision(documentPath);
   }
 
   async truncate(documentPath: TemporalFilePath, size: number): Promise<void> {
@@ -179,9 +184,9 @@ export class NodeTemporalFileRepository implements TemporalFileRepository {
       throw new Error(`Document with path ${documentPath.value} not found`);
     }
 
-    fs.truncateSync(pathToWrite, size);
-
     this.bumpRevision(documentPath);
+
+    fs.truncateSync(pathToWrite, size);
   }
 
   async stream(documentPath: TemporalFilePath): Promise<Readable> {
