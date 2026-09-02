@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"time"
 
 	"internxt/drive-desktop-linux/fuse-daemon/internal/client"
 
@@ -180,6 +181,28 @@ func (fs *InternxtFilesystem) Truncate(name string, size uint64, context *fuse.C
 	}{Path: name, Size: size}
 
 	return fs.client.Post(context, client.OperationTruncate, body, nil)
+}
+
+// Utimens sets a file's access and modification times, as utimensat(2) asks.
+// Only the modification time is forwarded: the backend has nowhere to store an
+// access time, and reporting success for a value that is silently dropped would
+// be worse than refusing it.
+//
+// A nil Mtime means "leave the modification time alone" (UTIME_OMIT), which
+// needs no backend call at all.
+func (fs *InternxtFilesystem) Utimens(name string, atime *time.Time, mtime *time.Time, context *fuse.Context) fuse.Status {
+	fs.logger.Debug("Received Utimens call", "path", name)
+
+	if mtime == nil {
+		return fuse.OK
+	}
+
+	body := struct {
+		Path             string `json:"path"`
+		ModificationTime string `json:"modificationTime"`
+	}{Path: name, ModificationTime: mtime.UTC().Format(time.RFC3339Nano)}
+
+	return fs.client.Post(context, client.OperationUtimens, body, nil)
 }
 
 func (fs *InternxtFilesystem) GetXAttr(name string, attr string, context *fuse.Context) ([]byte, fuse.Status) {
