@@ -75,11 +75,11 @@ export class TemporalFileUploader {
     const stopWatching = this.repository.watchFile(temporalFile.path, () => controller.abort());
 
     try {
-      const contentsId = await this.uploadWithRetry(temporalFile, controller, replaces);
+      const { contentsId, revision } = await this.uploadWithRetry(temporalFile, controller, replaces);
 
       logger.debug({ msg: `${temporalFile.path.value} uploaded with id ${contentsId}` });
 
-      await this.publishUploadEvent(contentsId, temporalFile, replaces);
+      await this.publishUploadEvent(contentsId, temporalFile, replaces, revision);
 
       return contentsId;
     } finally {
@@ -91,14 +91,14 @@ export class TemporalFileUploader {
     temporalFile: TemporalFile,
     controller: AbortController,
     replaces?: Replaces,
-  ): Promise<ContentsId> {
+  ): Promise<{ contentsId: ContentsId; revision: number | undefined }> {
     const errorHandler = createTransientErrorHandler({
       tag: 'SYNC-ENGINE',
       context: 'TEMPORAL FILE UPLOAD RETRY',
       path: temporalFile.path.value,
     });
 
-    const { data: contentsId, error } = await retryWithBackoff(
+    const { data: uploaded, error } = await retryWithBackoff(
       () => this.executeUpload(temporalFile, controller, replaces),
       errorHandler,
       controller.signal,
@@ -106,15 +106,30 @@ export class TemporalFileUploader {
 
     if (error) throw error;
 
-    return contentsId;
+    return uploaded;
   }
 
   private async executeUpload(
     temporalFile: TemporalFile,
     controller: AbortController,
     replaces?: Replaces,
-  ): Promise<Result<ContentsId, DriveDesktopError>> {
+  ): Promise<Result<{ contentsId: ContentsId; revision: number | undefined }, DriveDesktopError>> {
     try {
+      // Read the revision here rather than reusing the one the caller found:
+      // between that lookup and this point the file has been size-checked and
+      // space-checked, and the space check is a network round trip. A write in
+      // that window is uploaded by the stream below while the caller's revision
+      // still describes the older bytes.
+      //
+      // Read it BEFORE opening the stream, never after. A write between this
+      // read and the open makes the recorded revision older than the bytes
+      // sent, so the reaper sees a difference and KEEPS the staged copy, which
+      // costs one extra upload. Reading it after the open would make the
+      // recorded revision newer than the bytes sent, and the reaper would
+      // delete a staged copy holding data that never reached the cloud.
+      const staged = await this.repository.find(temporalFile.path);
+      const revision = staged.isPresent() ? staged.get().revision : undefined;
+
       const stream = await this.repository.stream(temporalFile.path);
 
       const uploader = this.uploaderFactory
@@ -125,7 +140,7 @@ export class TemporalFileUploader {
         .build();
 
       const uploadedContentsId = await uploader();
-      return { data: uploadedContentsId as ContentsId };
+      return { data: { contentsId: uploadedContentsId as ContentsId, revision } };
     } catch (uploadError) {
       return {
         error: mapEnvironmentUploadError(uploadError as Error & { status?: unknown }),
@@ -137,6 +152,7 @@ export class TemporalFileUploader {
     contentsId: ContentsId,
     temporalFile: TemporalFile,
     replaces?: Replaces,
+    uploadedRevision?: number,
   ): Promise<void> {
     const fileBuffer = await this.getThumbnailBufferIfNeeded(temporalFile);
 
@@ -147,7 +163,7 @@ export class TemporalFileUploader {
       replaces: replaces?.contentsId,
       fileBuffer,
       contentFilePath: temporalFile.contentFilePath,
-      uploadedModifiedTime: temporalFile.modifiedTime,
+      uploadedRevision,
     });
 
     await this.eventBus.publish([contentsUploadedEvent]);
