@@ -3,6 +3,9 @@ import { Container } from 'diod';
 import { FuseCodes } from '../../../../../apps/drive/fuse/callbacks/FuseCodes';
 import { FirstsFileSearcher } from '../../../../../context/virtual-drive/files/application/search/FirstsFileSearcher';
 import { FileRepository } from '../../../../../context/virtual-drive/files/domain/FileRepository';
+import { PendingModificationTimes } from '../../../../../context/virtual-drive/files/application/utimens/PendingModificationTimes';
+import { TemporalFileByPathFinder } from '../../../../../context/storage/TemporalFiles/application/find/TemporalFileByPathFinder';
+import type { TemporalFile } from '../../../../../context/storage/TemporalFiles/domain/TemporalFile';
 import type { File } from '../../../../../context/virtual-drive/files/domain/File';
 import { setModificationTime } from '../../../../../infra/drive-server/services/files/services/set-modification-time';
 import { utimens } from './utimens.service';
@@ -16,6 +19,8 @@ describe('utimens', () => {
   let container: ReturnType<typeof mockDeep<Container>>;
   const firstsFileSearcher = mockDeep<FirstsFileSearcher>();
   const fileRepository = mockDeep<FileRepository>();
+  const temporalFileFinder = mockDeep<TemporalFileByPathFinder>();
+  const pendingModificationTimes = mockDeep<PendingModificationTimes>();
   const setModificationTimeMock = vi.mocked(setModificationTime);
 
   let file: File;
@@ -25,6 +30,9 @@ describe('utimens', () => {
     container = mockDeep<Container>();
     container.get.calledWith(FirstsFileSearcher).mockReturnValue(firstsFileSearcher);
     container.get.calledWith(FileRepository).mockReturnValue(fileRepository);
+    container.get.calledWith(TemporalFileByPathFinder).mockReturnValue(temporalFileFinder);
+    container.get.calledWith(PendingModificationTimes).mockReturnValue(pendingModificationTimes);
+    temporalFileFinder.run.mockResolvedValue(undefined);
 
     file = {
       uuid: 'a-uuid',
@@ -66,12 +74,37 @@ describe('utimens', () => {
     expect(fileRepository.update).not.toHaveBeenCalled();
   });
 
-  it('should return ENOENT when the file is not on the drive', async () => {
+  it('should return ENOENT when the path is neither on the drive nor staged', async () => {
     firstsFileSearcher.run.mockResolvedValue(undefined);
+    temporalFileFinder.run.mockResolvedValue(undefined);
 
     const { error } = await utimens({ path: '/nope.txt', modificationTime: REQUESTED, container });
 
     expect(error?.code).toBe(FuseCodes.ENOENT);
     expect(setModificationTimeMock).not.toHaveBeenCalled();
+  });
+
+  describe('when the file is still staged, which is what cp -p does', () => {
+    beforeEach(() => {
+      // cp -p calls utimensat on the open descriptor BEFORE close, so no drive
+      // record exists yet, only a temporal file.
+      firstsFileSearcher.run.mockResolvedValue(undefined);
+      temporalFileFinder.run.mockResolvedValue({} as unknown as TemporalFile);
+    });
+
+    it('should succeed rather than returning ENOENT', async () => {
+      const { data, error } = await utimens({ path: '/some/file.txt', modificationTime: REQUESTED, container });
+
+      expect(error).toBeUndefined();
+      expect(data).toBeUndefined();
+    });
+
+    it('should hold the time for the upload to carry, and not call the drive', async () => {
+      await utimens({ path: '/some/file.txt', modificationTime: REQUESTED, container });
+
+      expect(pendingModificationTimes.set).toHaveBeenCalledWith('/some/file.txt', REQUESTED);
+      expect(setModificationTimeMock).not.toHaveBeenCalled();
+      expect(fileRepository.update).not.toHaveBeenCalled();
+    });
   });
 });
