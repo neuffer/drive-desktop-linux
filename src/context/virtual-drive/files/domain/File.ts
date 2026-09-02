@@ -40,8 +40,33 @@ export class File extends AggregateRoot {
     public createdAt: Date,
     public updatedAt: Date,
     private _status: FileStatus,
+    // The time the file's CONTENTS were last modified, as opposed to updatedAt,
+    // which is when the drive row last changed. Undefined for a record that
+    // predates the field or carries an unparseable one; the getter falls back.
+    private _modificationTime?: Date,
   ) {
     super();
+  }
+
+  /**
+   * The modification time to report to the filesystem.
+   *
+   * Falls back to updatedAt when the real value is unknown, which is what the
+   * macOS/Windows client does with the same field
+   * (`remote.modificationTime ?? remote.updatedAt`). Without the fallback a file
+   * stored before this field was kept would report an invalid date to stat.
+   */
+  public get modificationTime(): Date {
+    return this._modificationTime ?? this.updatedAt;
+  }
+
+  /**
+   * Records a modification time set through utimensat(2). The caller is
+   * responsible for persisting it remotely and through the repository; this
+   * only updates the in-memory aggregate.
+   */
+  setModificationTime(modificationTime: Date): void {
+    this._modificationTime = modificationTime;
   }
 
   public get id(): number {
@@ -99,6 +124,7 @@ export class File extends AggregateRoot {
       new Date(attributes.createdAt),
       new Date(attributes.updatedAt),
       FileStatus.fromValue(attributes.status),
+      parseModificationTime(attributes.modificationTime),
     );
   }
 
@@ -113,6 +139,7 @@ export class File extends AggregateRoot {
       new Date(attributes.createdAt),
       new Date(attributes.updatedAt),
       FileStatus.Exists,
+      parseModificationTime(attributes.modificationTime),
     );
 
     file.record(
@@ -222,6 +249,10 @@ export class File extends AggregateRoot {
       this.updatedAt = new Date(attributes.updatedAt);
     }
 
+    if (attributes.modificationTime) {
+      this._modificationTime = parseModificationTime(attributes.modificationTime);
+    }
+
     if (attributes.createdAt) {
       this.createdAt = new Date(attributes.createdAt);
     }
@@ -246,7 +277,19 @@ export class File extends AggregateRoot {
       size: this.size,
       updatedAt: this.updatedAt.toISOString(),
       status: this.status.value,
-      modificationTime: this.updatedAt.toISOString(),
+      modificationTime: this.modificationTime.toISOString(),
     };
   }
+}
+
+/**
+ * Turns a stored modification time into a Date, or undefined when it cannot be
+ * one. Records written before the field was kept carry an empty or absent
+ * value, and `new Date('')` is an Invalid Date that would reach stat as NaN.
+ */
+function parseModificationTime(value: string | undefined): Date | undefined {
+  if (!value) return undefined;
+
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? undefined : parsed;
 }

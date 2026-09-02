@@ -15,6 +15,57 @@ describe('File', () => {
     status: FileStatuses.EXISTS,
   };
 
+  describe('modificationTime', () => {
+    // The two times are deliberately DIFFERENT in every case below. When the
+    // fixture gives them the same value, an assertion cannot tell which field
+    // was read and passes whichever one the code uses.
+    const CONTENT_TIME = '2024-03-04T05:06:07.000Z';
+    const ROW_TIME = '2025-01-01T00:00:00.000Z';
+
+    it('should keep the modification time it was built with, not the row time', () => {
+      const file = File.from({ ...fileMock, modificationTime: CONTENT_TIME, updatedAt: ROW_TIME });
+
+      expect(file.modificationTime.toISOString()).toBe(CONTENT_TIME);
+      expect(file.updatedAt.toISOString()).toBe(ROW_TIME);
+    });
+
+    it('should fall back to the row time when there is no modification time', () => {
+      const file = File.from({ ...fileMock, modificationTime: '', updatedAt: ROW_TIME });
+
+      expect(file.modificationTime.toISOString()).toBe(ROW_TIME);
+    });
+
+    it('should fall back to the row time when the modification time cannot be parsed', () => {
+      const file = File.from({ ...fileMock, modificationTime: 'not a date', updatedAt: ROW_TIME });
+
+      expect(file.modificationTime.toISOString()).toBe(ROW_TIME);
+    });
+
+    it('should emit the modification time in its attributes rather than the row time', () => {
+      const file = File.from({ ...fileMock, modificationTime: CONTENT_TIME, updatedAt: ROW_TIME });
+
+      expect(file.attributes().modificationTime).toBe(CONTENT_TIME);
+    });
+
+    it('should take a new modification time from setModificationTime', () => {
+      const file = File.from({ ...fileMock, modificationTime: CONTENT_TIME, updatedAt: ROW_TIME });
+      const requested = new Date('2020-07-08T09:10:11.000Z');
+
+      file.setModificationTime(requested);
+
+      expect(file.modificationTime).toEqual(requested);
+      expect(file.updatedAt.toISOString()).toBe(ROW_TIME);
+    });
+
+    it('should update the modification time when provided', () => {
+      const file = File.from({ ...fileMock, modificationTime: CONTENT_TIME, updatedAt: ROW_TIME });
+
+      file.update({ modificationTime: '2021-02-03T04:05:06.000Z' });
+
+      expect(file.modificationTime.toISOString()).toBe('2021-02-03T04:05:06.000Z');
+    });
+  });
+
   describe('update', () => {
     it('should update the path when provided', () => {
       const file = File.from(fileMock);

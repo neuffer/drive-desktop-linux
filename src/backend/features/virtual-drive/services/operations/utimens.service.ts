@@ -3,6 +3,7 @@ import { Container } from 'diod';
 import { FuseCodes } from '../../../../../apps/drive/fuse/callbacks/FuseCodes';
 import { FuseError } from '../../../../../apps/drive/fuse/callbacks/FuseErrors';
 import { Result } from '../../../../../context/shared/domain/Result';
+import { FileRepository } from '../../../../../context/virtual-drive/files/domain/FileRepository';
 import { FirstsFileSearcher } from '../../../../../context/virtual-drive/files/application/search/FirstsFileSearcher';
 import { setModificationTime } from '../../../../../infra/drive-server/services/files/services/set-modification-time';
 
@@ -40,6 +41,12 @@ export async function utimens({ path, modificationTime, container }: UtimensProp
       logger.error({ msg: '[FUSE - Utimens] Unable to set modification time', error: result.error, path });
       return { error: new FuseError(FuseCodes.EIO, `[FUSE - Utimens] Remote update failed: ${path}`) };
     }
+
+    // GetAttr answers stat from the local repository, not from the drive, so a
+    // remote-only update would leave the next stat reporting the old time and
+    // make a successful utimensat look like it did nothing.
+    virtualFile.setModificationTime(modificationTime);
+    await container.get(FileRepository).update(virtualFile);
 
     return { data: undefined };
   } catch (error: unknown) {
