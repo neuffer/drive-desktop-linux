@@ -147,6 +147,7 @@ export class TemporalFileUploader {
       replaces: replaces?.contentsId,
       fileBuffer,
       contentFilePath: temporalFile.contentFilePath,
+      uploadedModifiedTime: temporalFile.modifiedTime,
     });
 
     await this.eventBus.publish([contentsUploadedEvent]);
