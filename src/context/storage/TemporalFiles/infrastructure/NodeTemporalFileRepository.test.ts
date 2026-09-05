@@ -96,6 +96,24 @@ describe('NodeTemporalFileRepository', () => {
       await snapshot.dispose();
     });
 
+    it('should fail the stream when the file is truncated below the declared length', async () => {
+      const documentPath = new TemporalFilePath('/Documents/database.kdbx');
+
+      await repository.create(documentPath);
+      await repository.write(documentPath, Buffer.from('the whole declared body'), 23, 0);
+
+      const snapshot = await repository.createUploadSnapshot(documentPath);
+      expect(snapshot.size).toBe(23);
+
+      // The half the upper bound cannot cover. Ending the stream quietly here
+      // is what sends a body shorter than the content length already declared.
+      await repository.truncate(documentPath, 4);
+
+      await expect(readAll(snapshot.open())).rejects.toThrow('truncated during the upload');
+
+      await snapshot.dispose();
+    });
+
     it('should let a retry read the same length again rather than resuming or failing', async () => {
       const documentPath = new TemporalFilePath('/Documents/database.kdbx');
 

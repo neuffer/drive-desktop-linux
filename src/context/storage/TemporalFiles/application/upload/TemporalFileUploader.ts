@@ -6,6 +6,7 @@ import { TemporalFileRepository } from '../../domain/TemporalFileRepository';
 import { TemporalFileUploaderFactory } from '../../domain/upload/TemporalFileUploaderFactory';
 import { TemporalFileUploadedDomainEvent } from '../../domain/upload/TemporalFileUploadedDomainEvent';
 import { TemporalFileUploadSnapshot } from '../../domain/upload/TemporalFileUploadSnapshot';
+import { StagedFileTruncatedError } from '../../domain/upload/StagedFileTruncatedError';
 import { EventBus } from '../../../../virtual-drive/shared/domain/EventBus';
 import { Replaces } from '../../domain/upload/Replaces';
 import { TemporalFile } from '../../domain/TemporalFile';
@@ -248,6 +249,16 @@ export class TemporalFileUploader {
       const uploadedContentsId = await uploader();
       return { data: uploadedContentsId as ContentsId };
     } catch (uploadError) {
+      // A proven truncation is an abort, not an unknown upload failure, and the
+      // difference is the whole point: `release` DELETES the staged copy for a
+      // generic failure and preserves it for an abort. Letting this fall
+      // through to mapEnvironmentUploadError yields cause UNKNOWN and destroys
+      // the write that caused the truncation - the same data loss the watcher
+      // path is written to avoid, reached by the other detector.
+      if (uploadError instanceof StagedFileTruncatedError) {
+        return { error: new DriveDesktopError('ABORTED', uploadError.message) };
+      }
+
       return {
         error: mapEnvironmentUploadError(uploadError as Error & { status?: unknown }),
       };

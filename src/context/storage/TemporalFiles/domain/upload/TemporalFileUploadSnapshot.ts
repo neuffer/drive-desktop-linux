@@ -19,10 +19,11 @@ import { Readable } from 'stream';
  * computes from the bytes that attempt actually sends - but nothing may cache
  * such a value across attempts.
  *
- * If the file is truncated below `size`, `open()` yields fewer bytes than
- * declared: the bound is an upper one only. What is guaranteed is that no
- * attempt sends MORE than it declared, which is the condition the server
- * rejects.
+ * If the file is truncated below `size`, `open()` FAILS the stream rather than
+ * ending it short. The bound is an upper one on what is read, but a body
+ * shorter than the declared length is not a smaller upload, it is a broken
+ * request, so the attempt errors instead of completing quietly. No attempt ever
+ * sends more than it declared, and none now sends less.
  */
 export interface TemporalFileUploadSnapshot {
   readonly size: number;

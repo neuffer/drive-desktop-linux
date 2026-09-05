@@ -1,3 +1,5 @@
+import { vi } from 'vitest';
+import fs from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -280,6 +282,44 @@ describe('TemporalFileUploader upload consistency', () => {
     uploaderFactory.attempts.forEach((attempt) => {
       expect(attempt.declaredLength).toBe(attempt.bytesStreamed);
     });
+  });
+
+  it('should report a truncation the stream proved as an abort, not as an unknown failure', async () => {
+    await repository.create(documentPath);
+    await writeBackingFile('the whole declared body, several chunks of it');
+
+    const temporalFile = await buildTemporalFile();
+
+    // The race the watcher can lose: the truncation is proven by the read
+    // itself, with no watch event having arrived. The upload must still fail as
+    // an ABORT, because release() deletes the staged copy for every other kind
+    // of failure and the staged copy is the user's only copy.
+    const backingFile = temporalFile.contentFilePath;
+    if (!backingFile) {
+      throw new Error('The staged copy has no backing file, so there is nothing to truncate');
+    }
+
+    const snapshotFactory = repository.createUploadSnapshot.bind(repository);
+    vi.spyOn(repository, 'createUploadSnapshot').mockImplementation(async (path) => {
+      const snapshot = await snapshotFactory(path);
+
+      return {
+        ...snapshot,
+        open: () => {
+          // Truncate as the stream is handed over, so the bounded read runs out
+          // of file. watchFile is stubbed to silence, so nothing else can abort.
+          fs.truncateSync(backingFile, 4);
+          return snapshot.open();
+        },
+        dispose: () => snapshot.dispose(),
+      };
+    });
+
+    vi.spyOn(repository, 'watchFile').mockReturnValue(() => {});
+
+    const sut = new TemporalFileUploader(repository, uploaderFactory, eventBus);
+
+    await expect(sut.run(temporalFile)).rejects.toMatchObject({ cause: 'ABORTED' });
   });
 
   it('should reject a file that grew past the upload limit after its size was read', async () => {

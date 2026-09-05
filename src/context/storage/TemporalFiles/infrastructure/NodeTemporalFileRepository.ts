@@ -9,6 +9,7 @@ import { TemporalFile } from '../domain/TemporalFile';
 import { TemporalFilePath } from '../domain/TemporalFilePath';
 import { TemporalFileRepository } from '../domain/TemporalFileRepository';
 import { TemporalFileUploadSnapshot } from '../domain/upload/TemporalFileUploadSnapshot';
+import { StagedFileTruncatedError } from '../domain/upload/StagedFileTruncatedError';
 import { Optional } from '../../../../shared/types/Optional';
 import { exec } from 'child_process';
 import { ensureFolderExists } from '../../../../apps/shared/fs/ensure-folder-exists';
@@ -228,11 +229,17 @@ export class NodeTemporalFileRepository implements TemporalFileRepository {
     while (position < size) {
       const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, size - position), position);
 
-      // A short read means the file was truncated under us. The upload then
-      // sends fewer bytes than it declared, which is the one-sided limit the
-      // interface documents; it is not this loop's to repair.
+      // A short read means the file was truncated under us, and there is no
+      // recovering the promise already made: `size` bytes were declared to the
+      // server and fewer exist. Ending the stream quietly here is what sends a
+      // body shorter than its content length.
+      //
+      // The watcher aborts this case too, and usually first, but it is driven
+      // by an fs event and can lose the race against a read already in flight.
+      // Here the truncation is not suspected, it is proven, so this is where
+      // the guarantee has to be enforced rather than reported.
       if (bytesRead === 0) {
-        return;
+        throw new StagedFileTruncatedError(size, position);
       }
 
       position += bytesRead;
