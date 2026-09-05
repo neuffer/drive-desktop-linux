@@ -24,6 +24,7 @@ import { FileCreatorTestClass } from '../../../../../context/virtual-drive/files
 import { FileOverriderTestClass } from '../../../../../context/virtual-drive/files/__test-helpers__/FileOverriderTestClass';
 import { FileMother } from '../../../../../context/virtual-drive/files/domain/__test-helpers__/FileMother';
 import { release } from './release.service';
+import { PendingModificationTimes } from '@/context/virtual-drive/files/application/utimens/PendingModificationTimes';
 
 vi.mock('../../../usage/validate-space', () => ({
   validateSpace: vi.fn().mockResolvedValue({ data: { hasSpace: true } }),
@@ -127,6 +128,7 @@ describe('a release after an override uploads nothing', () => {
     const bus = new NodeJsEventBus();
 
     const builder = new ContainerBuilder();
+    builder.register(PendingModificationTimes).useInstance(new PendingModificationTimes());
     builder.register(TemporalFileRepository).useInstance(repository);
     builder.register(TemporalFileUploaderFactory).useInstance(uploaderFactory);
     builder.register(EventBus).useInstance(bus);
