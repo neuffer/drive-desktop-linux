@@ -91,7 +91,7 @@ describe('upload-file-to-backup', () => {
     expect(createFileToBackendMock).not.toHaveBeenCalled();
   });
 
-  it('should return error when metadata creation fails and delete the uploaded content', async () => {
+  it('should return the error without deleting the content when metadata creation fails for an unproven reason', async () => {
     const contentsId = 'contents-id-123';
     const metadataError = new DriveDesktopError('BAD_RESPONSE', 'Metadata failed');
     uploadContentMock.mockResolvedValue({ data: contentsId });
@@ -101,7 +101,41 @@ describe('upload-file-to-backup', () => {
     const result = await uploadFileToBackup({ ...baseParams, signal: abortController.signal });
 
     expect(result.error).toBe(metadataError);
-    expect(deleteFileMock).toHaveBeenCalledWith({ bucketId: baseParams.bucket, fileId: contentsId });
+    expect(deleteFileMock).not.toHaveBeenCalled();
+    expect(createFileToBackendMock).toHaveBeenCalledWith(expect.objectContaining({ contentsId }));
+  });
+
+  it.each(['ABORTED', 'UNKNOWN', 'BAD_RESPONSE', 'FILE_ALREADY_EXISTS'] as const)(
+    'should not delete the uploaded content when the failure does not prove the write was refused (%s)',
+    async (cause) => {
+      const contentsId = 'contents-id-123';
+      uploadContentMock.mockResolvedValue({ data: contentsId });
+      createFileToBackendMock.mockResolvedValue({ error: new DriveDesktopError(cause, cause) });
+
+      await uploadFileToBackup({ ...baseParams, signal: abortController.signal });
+
+      expect(deleteFileMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it('should not delete the content when a retry meets the row the first attempt committed', async () => {
+    // The sequence that makes every cause unsafe: the first metadata write
+    // commits and reports failure anyway, the retry meets its own row, and the
+    // server answers FILE_ALREADY_EXISTS. Deleting the contents id here would
+    // destroy the file that first attempt created.
+    const contentsId = 'contents-id-123';
+    uploadContentMock.mockResolvedValue({ data: contentsId });
+    // INTERNAL_SERVER_ERROR is retryable, so the loop really does go round
+    // again and reaches the conflict through the retry state machine.
+    createFileToBackendMock
+      .mockResolvedValueOnce({ error: new DriveDesktopError('INTERNAL_SERVER_ERROR', '502') })
+      .mockResolvedValue({ error: new DriveDesktopError('FILE_ALREADY_EXISTS', 'File already exists') });
+
+    const result = await uploadFileToBackup({ ...baseParams, signal: abortController.signal });
+
+    expect(createFileToBackendMock).toHaveBeenCalledTimes(2);
+    expect(deleteFileMock).not.toHaveBeenCalled();
+    expect(result.data).toBeNull();
   });
 
   it('should skip file when backend rejects metadata creation by upload size limit', async () => {
@@ -113,6 +147,9 @@ describe('upload-file-to-backup', () => {
     const result = await uploadFileToBackup({ ...baseParams, signal: abortController.signal });
 
     expect(result).toStrictEqual({ data: null });
+    // FILE_TOO_BIG is the one cause the server's own ordering proves is safe:
+    // createFile rejects on size before it creates a row, and an earlier committed
+    // attempt would have surfaced as a duplicate-name conflict instead.
     expect(deleteFileMock).toHaveBeenCalledWith({ bucketId: baseParams.bucket, fileId: contentsId });
     expect(addMaxFileSizeRejectionMock).toHaveBeenCalledWith({
       path: baseParams.path,
@@ -145,5 +182,6 @@ describe('upload-file-to-backup', () => {
 
     expect(result.data).toBeNull();
     expect(result.error).toBeUndefined();
+    expect(deleteFileMock).not.toHaveBeenCalled();
   });
 });

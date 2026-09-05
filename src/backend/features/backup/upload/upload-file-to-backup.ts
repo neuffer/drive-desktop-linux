@@ -89,7 +89,46 @@ async function uploadFile(file: UploadFileParams): Promise<Result<File | null, D
   );
 
   if (metadataResult.error) {
-    await deleteFileFromStorageByFileId({ bucketId: file.bucket, fileId: contentsId });
+    // Delete the uploaded content ONLY for FILE_TOO_BIG, and for nothing else.
+    //
+    // An error does not, in general, prove the metadata write did not land. An
+    // attempt can commit the row and still report failure, and INTERNAL_SERVER_ERROR
+    // is retryable, so the retry meets the row the first attempt created and comes
+    // back as FILE_ALREADY_EXISTS. That conflict is then indistinguishable from a
+    // genuine pre-existing file, so it cannot be treated as proof.
+    //
+    // FILE_TOO_BIG is the exception, and the server's own ordering is why.
+    // FileUseCases.createFile checks for a duplicate name FIRST and throws
+    // ConflictException, enforces the upload size limit SECOND, and only then calls
+    // fileRepository.create. So a size rejection happens before any row exists, and
+    // an earlier committed attempt could not surface as FILE_TOO_BIG - it would hit
+    // the duplicate-name branch and return a conflict instead.
+    //
+    // The distinction is worth keeping rather than deleting nothing at all. The
+    // storage an orphan occupies is charged to the user's own quota
+    // (bridge addTotalUsedSpaceBytes on upload completion, decremented only when the
+    // entry is removed), and an oversized file is retried on EVERY backup run because
+    // this path deliberately does not block it - so leaking here would cost the user a
+    // fresh copy of that file every run, invisibly, until backups fail as
+    // NOT_ENOUGH_SPACE.
+    //
+    // Getting it wrong the other way is worse, which is why the list is this short:
+    // DELETE /files/{bucketId}/{fileId} is not a content-only delete.
+    // FileUseCases.deleteFileByFileId looks the contents id up among the user's files
+    // and, when one matches, deletes the file itself.
+    if (metadataResult.error.cause === 'FILE_TOO_BIG') {
+      await deleteFileFromStorageByFileId({ bucketId: file.bucket, fileId: contentsId });
+    } else {
+      // Nothing reclaims this object on its own, so record the handle. Without it the
+      // only reference to the leaked content is gone the moment this function returns.
+      logger.warn({
+        tag: 'BACKUPS',
+        msg: 'Leaving uploaded content in place: the metadata failure does not prove it is unreferenced',
+        path: file.path,
+        contentsId,
+        cause: metadataResult.error.cause,
+      });
+    }
 
     if (metadataResult.error.cause === 'FILE_TOO_BIG') {
       addMaxFileSizeRejection({ path: file.path, fileSize: file.size, blockUploadPath: false });
