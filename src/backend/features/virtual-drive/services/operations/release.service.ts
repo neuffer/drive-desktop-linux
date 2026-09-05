@@ -99,8 +99,38 @@ export async function release({ path, processName, container }: Props): Promise<
         return { error: new FuseIOError('Upload failed due to insufficient storage or network issues.') };
       }
 
-      logger.error({ msg: '[Release] Upload failed, deleting temporal file', error: uploadError, path, processName });
-      await container.get(TemporalFileDeleter).run(path);
+      // No upload failure deletes the staged copy any more, and this is the
+      // change: it used to be the default for everything not named above.
+      //
+      // Until an upload succeeds, the staged copy is the ONLY place the bytes
+      // the user just wrote exist. A failure here says the upload did not
+      // complete; it does not say the data is expendable, and the two are not
+      // the same thing. A 5xx, a dropped connection, a permission error, an
+      // exception in the code below - none of them are evidence that the user
+      // wanted their file gone.
+      //
+      // The two cases above already worked this way, for a weaker reason than
+      // this one: they preserve a copy that was never sent, and so does this.
+      //
+      // The deletions that remain are the ones decided BEFORE the upload, and
+      // they are not all the same. An auxiliary file is not user data, so
+      // deleting it costs nothing. A size-blocked file IS user data, and
+      // deleting it is a real trade-off rather than an obvious one: the upload
+      // cannot succeed at the account's current limit, so preserving it would
+      // keep a copy that may never be sent. That branch is left exactly as it
+      // was, deliberately - it is a different decision from this one and it
+      // predates it - but it is the same shape of loss and it is worth
+      // revisiting separately.
+      //
+      // The cost of keeping it is disk space until the next close re-uploads
+      // it. The cost of deleting it was the file.
+      logger.error({
+        msg: '[Release] Upload failed, preserving the temporal file so the next close can retry it',
+        error: uploadError,
+        path,
+        processName,
+      });
+
       return { error: new FuseIOError('Upload failed due to insufficient storage or network issues.') };
     } finally {
       uploadsInProgress.delete(path);

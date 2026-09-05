@@ -164,7 +164,10 @@ describe('release', () => {
       calls(deleter.run).toHaveLength(0);
     });
 
-    it('should delete the file and return EIO when upload fails', async () => {
+    // Replaces 'should delete the file and return EIO when upload fails'. A
+    // failed upload is not sufficient evidence that the only local copy may be
+    // discarded. The EIO half is unchanged.
+    it('keeps the staged copy available for recovery when the upload fails', async () => {
       finder.run.mockResolvedValue(createTemporalFile('/Documents/report.pdf'));
       uploader.run.mockRejectedValue(new Error('Network error'));
 
@@ -172,7 +175,76 @@ describe('release', () => {
 
       expect(data).toBeUndefined();
       expect(error?.code).toBe(FuseCodes.EIO);
-      call(deleter.run).toStrictEqual('/Documents/report.pdf');
+      calls(deleter.run).toHaveLength(0);
+    });
+
+    it('lets a later close upload the copy the failed one preserved', async () => {
+      finder.run.mockResolvedValue(createTemporalFile('/Documents/report.pdf'));
+
+      // Reset explicitly: a persistent rejection set by an earlier test in this
+      // describe would otherwise outlive the Once below and fail the retry for
+      // the wrong reason.
+      uploader.run.mockReset();
+      uploader.run.mockRejectedValueOnce(new Error('Network error'));
+
+      const first = await release({ path: '/Documents/report.pdf', processName: 'cat', container });
+      expect(first.error?.code).toBe(FuseCodes.EIO);
+
+      // Preserving is only worth anything if the next close can still send it,
+      // so the retry is asserted rather than inferred from the absence of a
+      // delete. A byte-level version belongs in release.lifecycle.test.ts, which
+      // does not run on current main; see the commit message.
+      const second = await release({ path: '/Documents/report.pdf', processName: 'cat', container });
+
+      expect(second.error).toBeUndefined();
+      calls(uploader.run).toHaveLength(2);
+      calls(deleter.run).toHaveLength(0);
+    });
+
+    it('should preserve the file when the upload fails with a server error', async () => {
+      finder.run.mockResolvedValue(createTemporalFile('/Documents/report.pdf'));
+      uploader.run.mockRejectedValue(new DriveDesktopError('INTERNAL_SERVER_ERROR'));
+
+      const { error } = await release({ path: '/Documents/report.pdf', processName: 'cat', container });
+
+      expect(error?.code).toBe(FuseCodes.EIO);
+      calls(deleter.run).toHaveLength(0);
+    });
+
+    it('should preserve the file when a non-retryable permission error ends the upload', async () => {
+      finder.run.mockResolvedValue(createTemporalFile('/Documents/report.pdf'));
+      uploader.run.mockRejectedValue(new DriveDesktopError('ACTION_NOT_PERMITTED', 'forbidden'));
+
+      const { error } = await release({ path: '/Documents/report.pdf', processName: 'cat', container });
+
+      // Correctly not retried, and still not grounds for destroying the copy.
+      expect(error?.code).toBe(FuseCodes.EIO);
+      calls(deleter.run).toHaveLength(0);
+    });
+
+    it('should preserve the file when the lookup before the upload fails', async () => {
+      finder.run.mockResolvedValue(createTemporalFile('/Documents/report.pdf'));
+      fileSearcher.run.mockRejectedValue(new Error('the existing-file lookup failed'));
+
+      const { error } = await release({ path: '/Documents/report.pdf', processName: 'cat', container });
+
+      // Nothing was even attempted, so there is certainly nothing to clean up.
+      expect(error?.code).toBe(FuseCodes.EIO);
+      calls(uploader.run).toHaveLength(0);
+      calls(deleter.run).toHaveLength(0);
+    });
+
+    it('still deletes an auxiliary file, which is decided before any upload', async () => {
+      const auxiliary = createTemporalFile('/Documents/.report.pdf.swp');
+      vi.spyOn(auxiliary, 'isAuxiliary').mockReturnValue(true);
+      finder.run.mockResolvedValue(auxiliary);
+
+      const { error } = await release({ path: '/Documents/.report.pdf.swp', processName: 'cat', container });
+
+      // The deliberate deletions are the ones taken BEFORE the upload, where
+      // the outcome is known. Those are untouched by this change.
+      expect(error).toBeUndefined();
+      call(deleter.run).toStrictEqual('/Documents/.report.pdf.swp');
     });
 
     it('should skip the second release when an upload for the same path is already in progress', async () => {
