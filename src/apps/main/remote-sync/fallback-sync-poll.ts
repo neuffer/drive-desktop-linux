@@ -3,24 +3,12 @@ import eventBus from '../event-bus';
 import { areRemoteNotificationsEnabled } from '../realtime';
 import { remoteSyncManager, startRemoteSync } from './service';
 
-// Remote notifications are the client's only continuous path to remote state,
-// and they are switched off (`remoteNotificationsEnabled`, realtime.ts). With
-// them off, `startRemoteSync` is reached only from application start, a local
-// override, and the user pressing sync, so a file changed on another device is
-// invisible until one of those happens. On a machine where nobody is editing
-// files on the drive, that can be days.
+// A periodic fallback for the case where remote notifications are disabled and
+// nothing else asks for a sync on a timer. It runs only while they are off.
 //
-// This is the fallback that was missing, not a replacement for notifications:
-// it runs only while they are disabled, so re-enabling the socket makes it stop
-// starting.
-//
-// The interval is a placeholder and the vendor should choose it. A tick is not
-// free and is not a no-op either: `getFileCheckpoint` rewinds the newest local
-// `updatedAt` by six hours, so every tick re-fetches and re-upserts whatever
-// falls in that window. Measured on one real account that is 3 files and 3
-// folders, two requests; after a bulk upload it is however much of that upload
-// lands in six hours, paginated 1000 at a time, until newer activity moves the
-// window past it.
+// The interval is a placeholder for the vendor to set. A tick is not free:
+// `getFileCheckpoint` rewinds the newest local `updatedAt` by six hours, so each
+// one re-fetches whatever falls in that window.
 const FALLBACK_POLL_INTERVAL_MS = 15 * 60 * 1000;
 
 // Consecutive failures back off rather than hammering a server that is already
@@ -53,23 +41,28 @@ function nextDelay(): number {
     FALLBACK_POLL_MAX_INTERVAL_MS,
   );
   const spread = backoff * FALLBACK_POLL_JITTER;
+  const jittered = backoff - spread + Math.random() * 2 * spread;
 
-  // Uniform in [backoff - spread, backoff + spread].
-  return Math.round(backoff - spread + Math.random() * 2 * spread);
+  // Capped AFTER the jitter, so the maximum really is the maximum. Capping only
+  // the base would leave the true ceiling 20% above the stated one.
+  return Math.round(Math.min(jittered, FALLBACK_POLL_MAX_INTERVAL_MS));
 }
 
 /**
  * Runs one poll.
  *
- * @returns whether the sync actually succeeded, which is not the same as whether
- * it threw. `RemoteSyncManager.startRemoteSync` catches its own failures and
- * resolves normally, leaving the outcome in the manager's status, so a caller
- * that only watches for a rejection would treat a failed sync as a good one.
+ * @param forGeneration the polling lifetime this tick belongs to. Checked again
+ * after the await: the session can end while a sync is in flight, and work
+ * announced into the next session is worse than work not done.
+ * @returns whether this call's own sync completed. Not the same as whether it
+ * threw: `RemoteSyncManager.startRemoteSync` catches its own failures and
+ * resolves, and it also declines to start at all when a sync is already running,
+ * so neither a rejection nor the absence of one says what happened.
  */
-async function tick(): Promise<boolean> {
+async function tick(forGeneration: number): Promise<boolean> {
   // The manager's own `smokeTest` already refuses to start while a sync is
-  // running, so this is not the guard that protects it. It is here to skip the
-  // pointless call and the warning it would log.
+  // running, so this is not the guard that protects it. It skips the pointless
+  // call and the warning it would log.
   if (remoteSyncManager.getSyncStatus() === 'SYNCING') {
     logger.debug({ tag: 'SYNC-ENGINE', msg: '[Fallback poll] A sync is already running, skipping this tick' });
     return true;
@@ -79,15 +72,26 @@ async function tick(): Promise<boolean> {
 
   await startRemoteSync();
 
-  if (remoteSyncManager.getSyncStatus() === 'SYNC_FAILED') {
-    logger.warn({ tag: 'SYNC-ENGINE', msg: '[Fallback poll] The sync failed, not announcing remote changes' });
+  if (!running || forGeneration !== generation) {
+    logger.debug({ tag: 'SYNC-ENGINE', msg: '[Fallback poll] The session ended during this tick, not announcing' });
+    return true;
+  }
+
+  // Positively require SYNCED rather than merely excluding SYNC_FAILED. The
+  // pre-check above and this call are not atomic, so another trigger can start a
+  // sync in between; `smokeTest` then declines this one and the status is still
+  // SYNCING. Excluding only SYNC_FAILED would announce a sync that never ran.
+  if (remoteSyncManager.getSyncStatus() !== 'SYNCED') {
+    logger.warn({
+      tag: 'SYNC-ENGINE',
+      msg: '[Fallback poll] The sync did not complete, not announcing remote changes',
+      status: remoteSyncManager.getSyncStatus(),
+    });
     return false;
   }
 
-  // Both halves, exactly as the manual sync button does: `startRemoteSync`
-  // refreshes the local database, and this event is what consumers listen to in
-  // order to rebuild from it. Announcing after a failed sync would have them
-  // rebuild from contents that were never refreshed.
+  // Both halves, as the manual sync button does: `startRemoteSync` refreshes the
+  // local database, and this event is what consumers rebuild from.
   eventBus.emit('REMOTE_CHANGES_SYNCHED');
   return true;
 }
@@ -110,15 +114,21 @@ function scheduleNext(forGeneration: number): void {
 
     // The next tick is scheduled only after this one has finished, so a slow or
     // failing sync cannot stack ticks the way a fixed interval would.
-    void tick()
+    void tick(forGeneration)
       .then((succeeded) => {
-        consecutiveFailures = succeeded ? 0 : consecutiveFailures + 1;
+        // Only this lifetime's own result may move its backoff. A tick left over
+        // from a previous session must not make the current one back off.
+        if (forGeneration === generation) {
+          consecutiveFailures = succeeded ? 0 : consecutiveFailures + 1;
+        }
       })
       .catch((error) => {
         // A failed poll must never end the polling: the next remote change would
         // then be invisible until a restart, which is the condition this exists
         // to remove.
-        consecutiveFailures += 1;
+        if (forGeneration === generation) {
+          consecutiveFailures += 1;
+        }
         logger.error({ tag: 'SYNC-ENGINE', msg: '[Fallback poll] Sync failed, will try again', error });
       })
       .finally(() => {

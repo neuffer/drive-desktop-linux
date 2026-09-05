@@ -17,6 +17,7 @@ const sync = vi.mocked(startRemoteSync);
 const emit = vi.mocked(eventBus.emit);
 
 const INTERVAL_MS = 15 * 60 * 1000;
+const MAX_INTERVAL_MS = 60 * 60 * 1000;
 
 /**
  * Runs the next scheduled timeout and lets its promise chain settle.
@@ -81,6 +82,43 @@ describe('fallback sync poll', () => {
     expect(sync).toHaveBeenCalledTimes(2);
   });
 
+  it('does NOT announce when another trigger owns the sync, because ours never ran', async () => {
+    // The pre-check and the call are not atomic. Another trigger can start a
+    // sync in between; the manager's smokeTest then declines ours and the status
+    // is still SYNCING. Excluding only SYNC_FAILED would announce a sync that
+    // never happened.
+    syncStatus.mockReturnValueOnce('SYNCED');
+    sync.mockImplementation(async () => {
+      syncStatus.mockReturnValue('SYNCING');
+    });
+
+    startFallbackSyncPoll();
+    await nextTick();
+
+    expect(sync).toHaveBeenCalledTimes(1);
+    expect(emit).not.toHaveBeenCalled();
+  });
+
+  it('does NOT announce into the next session when logout lands mid-tick', async () => {
+    // The session can end while a sync is in flight. Announcing afterwards has
+    // consumers rebuild during a session that did not ask for it.
+    const inFlight = deferred<undefined>();
+    sync.mockReturnValueOnce(inFlight.promise);
+
+    startFallbackSyncPoll();
+    await vi.advanceTimersToNextTimerAsync();
+    expect(sync).toHaveBeenCalledTimes(1);
+
+    stopFallbackSyncPoll();
+
+    inFlight.resolve(undefined);
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(emit).not.toHaveBeenCalled();
+  });
+
   it('does NOT announce a sync that failed without throwing', async () => {
     // startRemoteSync catches its own failures and resolves, leaving the outcome
     // in the manager's status. A poll that only watched for a rejection would
@@ -131,6 +169,30 @@ describe('fallback sync poll', () => {
     // is exactly the backed-off interval: 15, then doubling to the 60 cap, then
     // straight back to 15 once a sync succeeds.
     expect(minutes).toEqual([15, 30, 60, 60, 15]);
+  });
+
+  it('never exceeds the stated maximum, even at full positive jitter', async () => {
+    // The cap has to bound the delay actually used, not the base it is computed
+    // from. Capping only the base leaves the real ceiling 20% above the number
+    // the patch and the report both advertise.
+    const scheduled = global.setTimeout;
+    const delays: number[] = [];
+    vi.spyOn(global, 'setTimeout').mockImplementation(((fn: () => void, ms?: number) => {
+      delays.push(ms ?? 0);
+      return scheduled(fn, ms);
+    }) as unknown as typeof setTimeout);
+
+    vi.spyOn(Math, 'random').mockReturnValue(1);
+    syncStatus.mockReturnValue('SYNC_FAILED');
+    startFallbackSyncPoll();
+
+    // Far enough into the backoff that the base has reached the cap.
+    await nextTick();
+    await nextTick();
+    await nextTick();
+    await nextTick();
+
+    expect(Math.max(...delays)).toBeLessThanOrEqual(MAX_INTERVAL_MS);
   });
 
   it('skips a tick while a sync is already running, and does not announce', async () => {
