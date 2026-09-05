@@ -16,6 +16,16 @@ let socket: Socket | undefined;
 
 const remoteNotificationsEnabled = false;
 
+/**
+ * Whether the client keeps a realtime notifications socket open.
+ *
+ * Exported so that the fallback sync poll can stand in exactly while this is
+ * off, and retire itself when it is on, rather than duplicating the decision.
+ */
+export function areRemoteNotificationsEnabled(): boolean {
+  return remoteNotificationsEnabled;
+}
+
 export type EventPayload = {
   eventName?: string;
   id?: number;

@@ -3,6 +3,7 @@ import { logger } from '@internxt/drive-desktop-core/build/backend';
 import eventBus from '../event-bus';
 import { setInitialSyncState } from './InitialSyncReady';
 import { remoteSyncManager, resyncRemoteSync, startRemoteSync } from './service';
+import { startFallbackSyncPoll, stopFallbackSyncPoll } from './fallback-sync-poll';
 
 ipcMain.handle('START_REMOTE_SYNC', async () => {
   await startRemoteSync();
@@ -26,9 +27,14 @@ eventBus.on('APP_DATA_SOURCE_INITIALIZED', async () => {
       error,
     });
   });
+
+  // Started after the first sync rather than before it, so the poll's own
+  // skip-while-syncing check does not have to carry the startup case.
+  startFallbackSyncPoll();
 });
 
 eventBus.on('USER_LOGGED_OUT', () => {
   setInitialSyncState('NOT_READY');
+  stopFallbackSyncPoll();
   remoteSyncManager.resetRemoteSync();
 });
