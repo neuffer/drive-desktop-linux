@@ -164,6 +164,21 @@ describe('release', () => {
       calls(deleter.run).toHaveLength(0);
     });
 
+    it('should preserve the temporal file and return EIO when the upload was aborted', async () => {
+      finder.run.mockResolvedValue(createTemporalFile('/Documents/report.pdf'));
+      uploader.run.mockRejectedValue(new DriveDesktopError('ABORTED', 'The file changed underneath the upload'));
+
+      const { data, error } = await release({ path: '/Documents/report.pdf', processName: 'cat', container });
+
+      expect(data).toBeUndefined();
+      expect(error?.code).toBe(FuseCodes.EIO);
+
+      // The staged copy holds the write that CAUSED the abort, so it is the
+      // newest copy of the user's data and the only one. Deleting it here is
+      // the data-loss path this test exists to hold shut.
+      calls(deleter.run).toHaveLength(0);
+    });
+
     it('should delete the file and return EIO when upload fails', async () => {
       finder.run.mockResolvedValue(createTemporalFile('/Documents/report.pdf'));
       uploader.run.mockRejectedValue(new Error('Network error'));

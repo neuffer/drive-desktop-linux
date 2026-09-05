@@ -99,6 +99,24 @@ export async function release({ path, processName, container }: Props): Promise<
         return { error: new FuseIOError('Upload failed due to insufficient storage or network issues.') };
       }
 
+      if (uploadError instanceof DriveDesktopError && uploadError.cause === 'ABORTED') {
+        // The upload was stopped because the staged copy no longer matches what
+        // it declared: the file was truncated under it, so the bytes here are
+        // NEWER than the ones being sent, not stale. Deleting them would throw
+        // away the only copy of the user's most recent write, and it is exactly
+        // the write that caused the abort. Keeping it costs one re-upload on
+        // the next release, which is the cheap side of this trade by a wide
+        // margin.
+        logger.warn({
+          msg: '[Release] Upload aborted because the file changed underneath it, preserving temporal file',
+          error: uploadError,
+          path,
+          processName,
+        });
+
+        return { error: new FuseIOError('Upload aborted because the file changed while it was being uploaded.') };
+      }
+
       logger.error({ msg: '[Release] Upload failed, deleting temporal file', error: uploadError, path, processName });
       await container.get(TemporalFileDeleter).run(path);
       return { error: new FuseIOError('Upload failed due to insufficient storage or network issues.') };
