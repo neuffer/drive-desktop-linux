@@ -96,12 +96,18 @@ export async function release({ path, processName, container }: Props): Promise<
           name: path.split('/').pop() ?? path,
         });
 
-        return { error: new FuseIOError('Upload failed due to insufficient storage or network issues.') };
+        return { error: new FuseIOError('Upload failed because the account does not have enough space.') };
       }
 
       logger.error({ msg: '[Release] Upload failed, deleting temporal file', error: uploadError, path, processName });
       await container.get(TemporalFileDeleter).run(path);
-      return { error: new FuseIOError('Upload failed due to insufficient storage or network issues.') };
+      // Everything that is not one of the cases above reaches here: a 5xx, a
+      // permission error, a rate limit, a timeout, a failed space check, and an
+      // exception in the lookup that runs before any upload is attempted. None
+      // of those is a storage or a network problem, so the message no longer
+      // claims to know which one it was. The log line above carries the real
+      // error; this string does not travel - the daemon reads only `errno`.
+      return { error: new FuseIOError('Upload failed for a reason the client did not recognize.') };
     } finally {
       uploadsInProgress.delete(path);
     }
