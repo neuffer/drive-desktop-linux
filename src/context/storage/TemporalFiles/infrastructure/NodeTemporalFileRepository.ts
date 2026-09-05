@@ -318,7 +318,7 @@ export class NodeTemporalFileRepository implements TemporalFileRepository {
     return Optional.of(doc);
   }
 
-  watchFile(documentPath: TemporalFilePath, callback: () => void): () => void {
+  watchFile(documentPath: TemporalFilePath, callback: (observedSize: number) => void): () => void {
     const pathToWatch = this.map.get(documentPath.value);
 
     logger.debug({ msg: `Watching file: ${documentPath.value}` });
@@ -327,19 +327,38 @@ export class NodeTemporalFileRepository implements TemporalFileRepository {
       throw new Error(`Document with path ${documentPath.value} not found`);
     }
 
-    const watcher = watch(pathToWatch, (_, filename) => {
-      if (filename !== documentPath.nameWithExtension()) {
-        return;
-      }
-
-      logger.warn({ msg: `Filename: ${filename}, has been changed` });
-
-      callback();
+    // No filter on the reported name. Exactly one file is watched, so every
+    // event is about that file, and the filter that used to stand here compared
+    // fs.watch's name (the uuid create() maps the document to) against the
+    // logical name on the drive. Those are two namespaces and can never be
+    // equal, so the early return was taken on every event and the callback was
+    // unreachable. On platforms that report a null filename it failed too.
+    const watcher = watch(pathToWatch, () => {
+      callback(NodeTemporalFileRepository.observedSizeOf(pathToWatch));
     });
 
     return () => {
       watcher.close();
     };
+  }
+
+  /**
+   * The length of a watched file, as seen from inside a watch callback.
+   *
+   * Synchronous on purpose: an async stat would resolve after further writes
+   * could have landed, so the size reported would describe a moment other than
+   * the event that asked for it.
+   *
+   * @returns the file's current length, or 0 when it cannot be stat'd. A
+   * deleted or unreadable backing file is reported as empty rather than
+   * throwing into fs.watch's callback, where nothing could catch it.
+   */
+  private static observedSizeOf(pathToWatch: string): number {
+    try {
+      return fs.statSync(pathToWatch).size;
+    } catch {
+      return 0;
+    }
   }
 
   statFs(): Promise<{ blocks: number; bfree: number; bavail: number; files: number; ffree: number; bsize: number }> {

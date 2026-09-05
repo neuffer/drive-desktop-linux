@@ -72,9 +72,37 @@ export class TemporalFileUploader {
     await this.validateLimits(temporalFile, temporalFile.size.value);
 
     const controller = new AbortController();
-    const stopWatching = this.repository.watchFile(temporalFile.path, () => controller.abort());
 
     let snapshot: TemporalFileUploadSnapshot | undefined;
+
+    // Only a file that has become SHORTER than the length this upload declared
+    // stops it. Growth is already harmless: the snapshot bounds every attempt's
+    // body to `size`, so bytes appended past that are simply not sent, and
+    // aborting on them would reject the ordinary case of an application still
+    // writing while its close is being served.
+    //
+    // A file below the declared length is the one case the bound cannot cover.
+    // It is an upper bound only, so a truncated file makes `open()` yield fewer
+    // bytes than were promised, and a body shorter than its content length is
+    // not something this client may send.
+    //
+    // Before the snapshot exists there is no declared length to fall short of,
+    // so events in that window are ignored; the length is taken from whatever
+    // the file is at that point, whatever happened before it.
+    const stopWatching = this.repository.watchFile(temporalFile.path, (observedSize) => {
+      if (!snapshot || observedSize >= snapshot.size) {
+        return;
+      }
+
+      logger.warn({
+        msg: '[TemporalFileUploader] The staged copy was truncated below the declared length; aborting the upload',
+        path: temporalFile.path.value,
+        declaredSize: snapshot.size,
+        observedSize,
+      });
+
+      controller.abort();
+    });
 
     try {
       // Read the revision here rather than reusing the one the caller found:

@@ -27,7 +27,18 @@ export abstract class TemporalFileRepository {
 
   abstract find(documentPath: TemporalFilePath): Promise<Optional<TemporalFile>>;
 
-  abstract watchFile(documentPath: TemporalFilePath, callback: () => void): () => void;
+  /**
+   * Reports every change to a staged copy's backing file, with the length that
+   * file has once the change has landed.
+   *
+   * The size is reported rather than judged: what counts as a change worth
+   * acting on belongs to the upload that declared a length, not to the storage
+   * that observes one. A size of 0 is reported when the file can no longer be
+   * stat'd, which is what a deletion looks like from here.
+   *
+   * @returns a function that stops the watch. Calling it twice is safe.
+   */
+  abstract watchFile(documentPath: TemporalFilePath, callback: (observedSize: number) => void): () => void;
 
   abstract areEqual(doc1: TemporalFilePath, doc2: TemporalFilePath): Promise<boolean>;
 

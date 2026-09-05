@@ -27,6 +27,9 @@ class RecordingUploaderFactory implements TemporalFileUploaderFactory {
   /** Runs after an attempt has been recorded, so a test can change the world between attempts. */
   afterAttempt: (attemptNumber: number) => Promise<void> = async () => {};
 
+  /** The controller the uploader shares with its retry loop, once one attempt has been built. */
+  controller: AbortController | undefined;
+
   private _readable: Readable | undefined;
   private _document: TemporalFile | undefined;
 
@@ -44,7 +47,9 @@ class RecordingUploaderFactory implements TemporalFileUploaderFactory {
     return this;
   }
 
-  abort() {
+  abort(controller: AbortController) {
+    // Captured so a test can wait on the abort itself rather than on a delay.
+    this.controller = controller;
     return this;
   }
 
@@ -192,6 +197,84 @@ describe('TemporalFileUploader upload consistency', () => {
 
     await sut.run(temporalFile);
 
+    expect(uploaderFactory.attempts).toHaveLength(2);
+
+    uploaderFactory.attempts.forEach((attempt) => {
+      expect(attempt.declaredLength).toBe(attempt.bytesStreamed);
+    });
+  });
+
+  /**
+   * Waits for the watcher to abort, so the assertion is on the abort itself
+   * rather than on a delay that could pass for the wrong reason.
+   *
+   * @throws Error when no abort arrives, which is the failure this reports.
+   */
+  async function waitForAbort(factory: RecordingUploaderFactory, timeoutMs = 5000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+      if (factory.controller?.signal.aborted) {
+        return;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    throw new Error('The upload was never aborted');
+  }
+
+  it('should abort the upload when the staged copy is truncated below the declared length', async () => {
+    await repository.create(documentPath);
+    await writeBackingFile('the bytes this upload declared, in full');
+
+    const temporalFile = await buildTemporalFile();
+
+    // The one case the declared length cannot absorb. Growth is bounded away by
+    // the snapshot, but a file shorter than what was promised makes the body
+    // shorter than its content length, and that is not ours to send.
+    uploaderFactory.failNextAttempts = 1;
+    uploaderFactory.afterAttempt = async (attemptNumber) => {
+      if (attemptNumber === 1) {
+        await repository.truncate(documentPath, 4);
+        await waitForAbort(uploaderFactory);
+      }
+    };
+
+    const sut = new TemporalFileUploader(repository, uploaderFactory, eventBus);
+
+    await expect(sut.run(temporalFile)).rejects.toMatchObject({ cause: 'ABORTED' });
+
+    // The retry never ran: the abort stopped the loop, it did not merely fail
+    // one attempt and let the next send a short body.
+    expect(uploaderFactory.attempts).toHaveLength(1);
+    expect(eventBus.publish).not.toHaveBeenCalled();
+  });
+
+  it('should not abort when the staged copy only grows', async () => {
+    await repository.create(documentPath);
+    await writeBackingFile('the bytes this upload declared');
+
+    const temporalFile = await buildTemporalFile();
+
+    // The negative half of the pair above, asserted on the watcher's own terms:
+    // an append is a change, it does reach the watcher, and it must not abort.
+    uploaderFactory.failNextAttempts = 1;
+    uploaderFactory.afterAttempt = async (attemptNumber) => {
+      if (attemptNumber === 1) {
+        const extra = Buffer.from(' and a great many more added later');
+        await repository.write(documentPath, extra, extra.byteLength, temporalFile.size.value);
+
+        // Long enough for the event to have landed had it been going to abort.
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+    };
+
+    const sut = new TemporalFileUploader(repository, uploaderFactory, eventBus);
+
+    await sut.run(temporalFile);
+
+    expect(uploaderFactory.controller?.signal.aborted).toBe(false);
     expect(uploaderFactory.attempts).toHaveLength(2);
 
     uploaderFactory.attempts.forEach((attempt) => {
